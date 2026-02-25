@@ -1,0 +1,131 @@
+name: Build Foxit Reader (x64) Continuous
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download upstream foxit-reader manifest
+        id: manifest
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/ScoopInstaller/Extras/master/bucket/foxit-reader.json" `
+            -OutFile "foxit-reader.json"
+
+          $m = Get-Content "foxit-reader.json" | ConvertFrom-Json
+          echo "version=$($m.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Get current release version (if exists)
+        id: current
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          try {
+            $release = Invoke-RestMethod `
+              -Headers @{ Authorization = "token $env:GITHUB_TOKEN" } `
+              -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/continuous"
+
+            echo "current=$($release.name)" >> $env:GITHUB_OUTPUT
+            echo "release_id=$($release.id)" >> $env:GITHUB_OUTPUT
+          } catch {
+            echo "current=" >> $env:GITHUB_OUTPUT
+            echo "release_id=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Decide whether to build
+        id: decide
+        shell: pwsh
+        run: |
+          $new = "${{ steps.manifest.outputs.version }}"
+          $old = "${{ steps.current.outputs.current }}"
+
+          Write-Host "Upstream version: $new"
+          Write-Host "Current release:  $old"
+
+          if ($new -eq $old) {
+            Write-Host "Versions match. Skipping build."
+            echo "build=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "New version detected. Proceeding with build."
+            echo "build=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Delete old release (if exists)
+        if: steps.decide.outputs.build == 'true' && steps.current.outputs.release_id != ''
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $id = "${{ steps.current.outputs.release_id }}"
+
+          Invoke-RestMethod `
+            -Headers @{ Authorization = "token $env:GITHUB_TOKEN" } `
+            -Method Delete `
+            -Uri "https://api.github.com/repos/$repo/releases/$id"
+
+      - name: Install Scoop
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          iwr -useb https://raw.githubusercontent.com/ScoopInstaller/install/master/install.ps1 | iex
+
+          $shim = "$env:USERPROFILE\scoop\shims\scoop.ps1"
+          echo "SCOOP_SHIM=$shim" >> $env:GITHUB_ENV
+          echo "SCOOP_ROOT=$env:USERPROFILE\scoop" >> $env:GITHUB_ENV
+
+      - name: Add Extras bucket
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          & $env:SCOOP_SHIM bucket add extras
+
+      - name: Update Scoop
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          & $env:SCOOP_SHIM update
+
+      - name: Install foxit-reader and 7zip
+        if: steps.decide.outputs.build == 'true'
+        shell: pwsh
+        run: |
+          & $env:SCOOP_SHIM install 7zip
+          & $env:SCOOP_SHIM install foxit-reader
+
+      - name: Package foxit-reader with 7-Zip
+        if: steps.decide.outputs.build == 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.manifest.outputs.version }}"
+          $archive = "foxit.7z"
+          $appDir = "$env:SCOOP_ROOT\apps\foxit-reader\current"
+          $sevenZip = "$env:SCOOP_ROOT\apps\7zip\current\7z.exe"
+
+          & $sevenZip a -t7z $archive "$appDir\*" | Out-Null
+
+          echo "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update continuous release (single step)
+        if: steps.decide.outputs.build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: continuous
+          name: ${{ steps.manifest.outputs.version }}
+          draft: false
+          prerelease: false
+          files: ${{ steps.package.outputs.archive }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
